@@ -127,14 +127,29 @@ Recovery time depends on the number of missing words:
 
 \*Times vary based on hardware. Uses all CPU cores by default.
 
+### Last Word Optimization
+
+When only the **last word** is missing, the tool applies an entropy-based optimization that dramatically reduces the search space:
+
+| Phrase Length | Standard Search | Optimized Search | Speedup |
+| ------------- | --------------- | ---------------- | ------- |
+| 12 words      | 2,048           | 128              | 16x     |
+| 15 words      | 2,048           | 64               | 32x     |
+| 18 words      | 2,048           | 32               | 64x     |
+| 21 words      | 2,048           | 16               | 128x    |
+| 24 words      | 2,048           | 8                | 256x    |
+
+This optimization exploits BIP-39's checksum structure: the last word contains both entropy bits and checksum bits, so only specific words can produce a valid mnemonic given the other known words.
+
 ## How It Works
 
 1. **Parse Input**: Identifies missing word positions (marked with `?`)
-2. **Generate Combinations**: Creates all possible word combinations from the BIP-39 wordlist (2048 words)
-3. **Checksum Validation**: Quickly rejects invalid mnemonics using BIP-39 checksum
-4. **Address Derivation**: Derives wallet address using blockchain-specific derivation path
-5. **Match Verification**: Compares derived address with target address
-6. **Output**: Saves recovered phrase to file when found
+2. **Entropy Optimization**: If only the last word is missing, pre-computes valid candidates using BIP-39 checksum constraints
+3. **Generate Combinations**: Creates word combinations from the candidate list (optimized or full wordlist)
+4. **Checksum Validation**: Quickly rejects invalid mnemonics (skipped when optimization is applied)
+5. **Address Derivation**: Derives wallet address using blockchain-specific derivation path
+6. **Match Verification**: Compares derived address with target address
+7. **Output**: Saves recovered phrase to file when found
 
 ## Output
 

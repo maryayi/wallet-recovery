@@ -10,10 +10,11 @@ Litecoin (LTC), Dogecoin (DOGE), and more.
 """
 
 import argparse
+import hashlib
 import itertools
 import sys
 from multiprocessing import Pool, cpu_count, Manager
-from typing import Optional
+from typing import Optional, List
 
 from mnemonic import Mnemonic
 from tqdm import tqdm
@@ -81,6 +82,16 @@ BLOCKCHAIN_CONFIG = {
     },
 }
 
+# BIP-39 phrase length configurations
+# Maps phrase length to (entropy_bits, checksum_bits)
+PHRASE_CONFIG = {
+    12: (128, 4),
+    15: (160, 5),
+    18: (192, 6),
+    21: (224, 7),
+    24: (256, 8),
+}
+
 # Global variables for multiprocessing
 wordlist = None
 target_address = None
@@ -89,17 +100,111 @@ phrase_template = None
 missing_indices = None
 found_result = None
 mnemonic_validator = None
+skip_checksum_validation = False
 
 
-def init_worker(wl, addr, bc, template, indices, result_dict):
+def compute_valid_last_words(known_words: List[str], wordlist: List[str]) -> List[str]:
+    """
+    Compute valid last words based on BIP-39 checksum constraints.
+
+    For a partial phrase with only the last word missing, we can compute
+    exactly which words would produce a valid checksum, dramatically reducing
+    the search space (e.g., from 2048 to ~128 for 12-word phrases).
+
+    Args:
+        known_words: List of known words (all except the last)
+        wordlist: BIP-39 wordlist
+
+    Returns:
+        List of valid last words that satisfy the checksum
+    """
+    phrase_len = len(known_words) + 1
+
+    if phrase_len not in PHRASE_CONFIG:
+        # Unknown phrase length, return all words
+        return wordlist
+
+    entropy_bits, checksum_bits = PHRASE_CONFIG[phrase_len]
+
+    # Build word-to-index mapping
+    word_to_idx = {word: idx for idx, word in enumerate(wordlist)}
+
+    # Convert known words to bits (11 bits per word)
+    bits = ""
+    for word in known_words:
+        if word not in word_to_idx:
+            # Invalid word, can't optimize
+            return wordlist
+        idx = word_to_idx[word]
+        bits += format(idx, "011b")
+
+    # Calculate how many entropy bits are in the last word
+    # Total bits from known words
+    known_bits = len(known_words) * 11
+    # Remaining entropy bits that must come from last word
+    remaining_entropy_bits = entropy_bits - known_bits
+
+    # For each possible value of remaining entropy bits, compute valid last word
+    valid_words = []
+    for i in range(2**remaining_entropy_bits):
+        # Complete the entropy
+        entropy_bits_str = bits + format(i, f"0{remaining_entropy_bits}b")
+
+        # Convert to bytes
+        entropy_bytes = int(entropy_bits_str, 2).to_bytes(entropy_bits // 8, "big")
+
+        # Calculate checksum (first N bits of SHA256)
+        h = hashlib.sha256(entropy_bytes).digest()
+        # Get first checksum_bits from hash
+        checksum_int = int.from_bytes(h[:1], "big") >> (8 - checksum_bits)
+
+        # Last word index = remaining entropy bits (high) + checksum bits (low)
+        last_word_idx = (i << checksum_bits) | checksum_int
+
+        if last_word_idx < 2048:
+            valid_words.append(wordlist[last_word_idx])
+
+    return valid_words
+
+
+def compute_valid_words_for_position(
+    known_words: List[str], missing_idx: int, phrase_len: int, wordlist: List[str]
+) -> List[str]:
+    """
+    Compute valid words for a specific missing position.
+
+    Currently optimized only for the last word position.
+    For other positions, returns full wordlist.
+
+    Args:
+        known_words: Template with None for missing positions
+        missing_idx: Index of the missing word
+        phrase_len: Total phrase length
+        wordlist: BIP-39 wordlist
+
+    Returns:
+        List of valid words for that position
+    """
+    # Only optimize for last word position
+    if missing_idx == phrase_len - 1:
+        # Extract known words (all except last)
+        words_before_last = [w for w in known_words[:missing_idx] if w != "?"]
+        if len(words_before_last) == phrase_len - 1:
+            return compute_valid_last_words(words_before_last, wordlist)
+
+    return wordlist
+
+
+def init_worker(wl, addr, bc, template, indices, result_dict, skip_checksum=False):
     """Initialize worker process with shared data."""
-    global wordlist, target_address, blockchain, phrase_template, missing_indices, found_result, mnemonic_validator
+    global wordlist, target_address, blockchain, phrase_template, missing_indices, found_result, mnemonic_validator, skip_checksum_validation
     wordlist = wl
     target_address = addr.lower() if addr.startswith("0x") else addr
     blockchain = bc
     phrase_template = template
     missing_indices = indices
     found_result = result_dict
+    skip_checksum_validation = skip_checksum
     # Create validator once per worker for efficiency
     mnemonic_validator = Bip39MnemonicValidator(Bip39Languages.ENGLISH)
 
@@ -160,11 +265,13 @@ def check_combination(word_combo: tuple) -> Optional[str]:
     mnemonic_str = " ".join(phrase)
 
     # Validate checksum first (fast rejection)
-    try:
-        if not mnemonic_validator.IsValid(mnemonic_str):
+    # Skip if we've already pre-computed valid words using entropy constraints
+    if not skip_checksum_validation:
+        try:
+            if not mnemonic_validator.IsValid(mnemonic_str):
+                return None
+        except Exception:
             return None
-    except Exception:
-        return None
 
     # Derive address and check
     derived = derive_address(mnemonic_str, blockchain)
@@ -218,15 +325,44 @@ def recover_phrase(
         print("No missing words indicated (use '?' as placeholder)")
         return None
 
+    phrase_len = len(words)
     missing_count = len(indices)
-    total_combinations = 2048 ** missing_count
+
+    # Determine valid word candidates for each missing position
+    # This optimizes the search space when the last word is missing
+    word_candidates = []
+    optimization_applied = False
+
+    for idx in indices:
+        if idx == phrase_len - 1 and missing_count == 1:
+            # Last word is the only missing word - apply entropy optimization
+            known_words = [w for w in words if w != "?"]
+            valid_words = compute_valid_last_words(known_words, wl)
+            word_candidates.append(valid_words)
+            optimization_applied = True
+        elif idx == phrase_len - 1:
+            # Last word is missing but there are other missing words too
+            # We can still optimize for the last position by pre-filtering
+            # But we need to generate combinations for other positions first
+            word_candidates.append(wl)  # Will be optimized in check_combination
+        else:
+            word_candidates.append(wl)
+
+    # Calculate total combinations
+    total_combinations = 1
+    for candidates in word_candidates:
+        total_combinations *= len(candidates)
 
     print(f"\n{'='*60}")
     print(f"BIP-39 Mnemonic Recovery")
     print(f"{'='*60}")
     print(f"Blockchain:       {blockchain_name}")
     print(f"Target Address:   {address}")
+    print(f"Phrase Length:    {phrase_len} words")
     print(f"Missing Words:    {missing_count} at position(s) {[i+1 for i in indices]}")
+    if optimization_applied:
+        print(f"Optimization:     Last-word entropy constraint applied")
+        print(f"Valid Candidates: {len(word_candidates[0])} (reduced from 2048)")
     print(f"Total Attempts:   {total_combinations:,}")
     print(f"Workers:          {workers}")
     print(f"{'='*60}\n")
@@ -238,8 +374,8 @@ def recover_phrase(
         if response.lower() != "yes":
             return None
 
-    # Generate all word combinations
-    combinations = itertools.product(wl, repeat=missing_count)
+    # Generate word combinations using optimized candidate lists
+    combinations = itertools.product(*word_candidates)
 
     # Setup multiprocessing with shared state
     manager = Manager()
@@ -251,10 +387,11 @@ def recover_phrase(
     addr_normalized = address.lower() if address.startswith("0x") else address
 
     # Process combinations in parallel with progress bar
+    # Skip checksum validation if we've pre-computed valid words
     with Pool(
         processes=workers,
         initializer=init_worker,
-        initargs=(wl, addr_normalized, blockchain_name, template, indices, result_dict),
+        initargs=(wl, addr_normalized, blockchain_name, template, indices, result_dict, optimization_applied),
     ) as pool:
         with tqdm(total=total_combinations, desc="Checking", unit="combo") as pbar:
             # Use imap_unordered for better performance
@@ -262,7 +399,7 @@ def recover_phrase(
 
             for result in pool.imap_unordered(
                 check_combination,
-                itertools.product(wl, repeat=missing_count),
+                itertools.product(*word_candidates),
                 chunksize=chunk_size,
             ):
                 pbar.update(1)
