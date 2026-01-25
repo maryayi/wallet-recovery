@@ -1,3 +1,9 @@
+# Core dependencies
 mnemonic>=0.20
 bip_utils>=2.9.0
 tqdm>=4.66.0
+
+# Optional: GPU acceleration (CUDA)
+# Uncomment the following lines if you have an NVIDIA GPU with CUDA support
+# numpy>=1.24.0
+# numba>=0.58.0
