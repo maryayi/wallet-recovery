@@ -11,6 +11,7 @@ A Python tool to recover missing words from BIP-39 mnemonic seed phrases by brut
 - **Fast Validation**: Checksum validation before address derivation for quick rejection
 - **Parallel Processing**: Multi-core CPU support for faster recovery
 - **Progress Tracking**: Real-time progress bar with completion estimates
+- **Resumable Sessions**: Interrupt and resume long-running recoveries; state is auto-saved periodically
 - **Flexible Input**: Mark unknown words with `?` placeholder
 
 ## Supported Blockchains
@@ -92,15 +93,21 @@ python recover.py -p "PHRASE" -a "ADDRESS" -b BLOCKCHAIN
 
 ### Arguments
 
-| Argument       | Short | Required | Description                                                            |
-| -------------- | ----- | -------- | ---------------------------------------------------------------------- |
-| `--phrase`     | `-p`  | Yes      | Partial mnemonic with `?` for missing words                            |
-| `--address`    | `-a`  | Yes      | Known wallet address to match                                          |
-| `--blockchain` | `-b`  | Yes      | Blockchain type (see supported list)                                   |
-| `--device`     | `-d`  | No       | Device: `auto`, `cpu`, `gpu`, `cuda`, or `opencl` (default: auto)      |
-| `--workers`    | `-w`  | No       | Number of CPU cores (default: all)                                     |
-| `--passphrase` |       | No       | Optional BIP-39 passphrase                                             |
-| `--output`     | `-o`  | No       | Output file (default: `recovered_phrase.txt`)                          |
+| Argument        | Short | Required | Description                                                       |
+| --------------- | ----- | -------- | ----------------------------------------------------------------- |
+| `--phrase`      | `-p`  | Yes\*    | Partial mnemonic with `?` for missing words                       |
+| `--address`     | `-a`  | Yes\*    | Known wallet address to match                                     |
+| `--blockchain`  | `-b`  | Yes\*    | Blockchain type (see supported list)                              |
+| `--device`      | `-d`  | No       | Device: `auto`, `cpu`, `gpu`, `cuda`, or `opencl` (default: auto) |
+| `--workers`     | `-w`  | No       | Number of CPU cores (default: all)                                |
+| `--passphrase`  |       | No       | Optional BIP-39 passphrase                                        |
+| `--output`      | `-o`  | No       | Output file (default: `recovered_phrase.txt`)                     |
+| `--resume`      |       | No       | Resume from a previously interrupted session                      |
+| `--state-file`  |       | No       | Custom state file path (default: `.wallet_recovery_state.json`)   |
+| `--clear-state` |       | No       | Clear saved state and start fresh                                 |
+| `--show-state`  |       | No       | Display saved state information and exit                          |
+
+\* Not required when using `--resume` (values are loaded from saved state)
 
 ### Examples
 
@@ -191,6 +198,85 @@ python recover.py \
   --device cpu
 ```
 
+#### Resume an Interrupted Session
+
+```bash
+# If you interrupt a running session with Ctrl+C, resume with:
+python recover.py --resume
+
+# Resume from a custom state file:
+python recover.py --resume --state-file my_session.json
+```
+
+#### View Saved State Information
+
+```bash
+python recover.py --show-state
+```
+
+#### Clear Saved State and Start Fresh
+
+```bash
+python recover.py \
+  -p "? abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
+  -a "0x9858EfFD232B4033E47d90003D41EC34EcaEda94" \
+  -b ethereum \
+  --clear-state
+```
+
+## State Management (Resumable Sessions)
+
+The tool automatically saves progress periodically, allowing you to interrupt and resume long-running recovery sessions.
+
+### How It Works
+
+- **Auto-save**: Progress is saved every 10,000 combinations to `.wallet_recovery_state.json`
+- **Graceful Interrupts**: Pressing `Ctrl+C` saves state before exiting
+- **Resume**: Use `--resume` to continue from where you left off
+- **Auto-cleanup**: State is automatically cleared on success or when all combinations are exhausted
+
+### State File Contents
+
+The state file stores:
+
+- Partial phrase, target address, blockchain, and passphrase
+- Device type (cpu/cuda/opencl)
+- Number of processed combinations and total combinations
+- Session ID and elapsed time
+
+### Example Workflow
+
+```bash
+# Start a recovery session
+python recover.py -p "? ? abandon abandon ..." -a "0x..." -b ethereum
+
+# Press Ctrl+C to interrupt
+# Output: "State saved. Processed 1,234,567 of 4,194,304 combinations."
+
+# Later, resume the session
+python recover.py --resume
+# Output: "Resuming previous session (ID: a1b2c3d4e5f6)"
+# Output: "Progress: 1,234,567 / 4,194,304 (29.4%)"
+
+# Check state without running
+python recover.py --show-state
+```
+
+### Multiple Sessions
+
+Use `--state-file` to manage multiple recovery sessions:
+
+```bash
+# Start first session
+python recover.py -p "..." -a "0x111..." -b ethereum --state-file session1.json
+
+# Start second session (different wallet)
+python recover.py -p "..." -a "0x222..." -b bitcoin --state-file session2.json
+
+# Resume specific session
+python recover.py --resume --state-file session1.json
+```
+
 ## Performance
 
 Recovery time depends on the number of missing words:
@@ -224,10 +310,10 @@ The tool supports two GPU backends for parallel checksum validation:
 
 #### Supported GPU Backends
 
-| Backend | GPU Support       | Library    | Notes                              |
-| ------- | ----------------- | ---------- | ---------------------------------- |
-| CUDA    | NVIDIA            | numba      | Best performance on NVIDIA GPUs    |
-| OpenCL  | Intel, AMD, NVIDIA| pyopencl   | Cross-platform, works with integrated GPUs |
+| Backend | GPU Support        | Library  | Notes                                      |
+| ------- | ------------------ | -------- | ------------------------------------------ |
+| CUDA    | NVIDIA             | numba    | Best performance on NVIDIA GPUs            |
+| OpenCL  | Intel, AMD, NVIDIA | pyopencl | Cross-platform, works with integrated GPUs |
 
 #### How It Works
 
@@ -240,13 +326,13 @@ GPU mode is particularly effective for 2+ missing words where checksum validatio
 
 #### Device Selection
 
-| Mode     | Best For          | Notes                                           |
-| -------- | ----------------- | ----------------------------------------------- |
-| `auto`   | Any               | Auto-selects best available (CUDA > OpenCL > CPU) |
-| `gpu`    | Any GPU           | Uses best available GPU backend                 |
-| `cuda`   | NVIDIA GPUs       | Forces CUDA backend                             |
-| `opencl` | Intel/AMD GPUs    | Forces OpenCL backend                           |
-| `cpu`    | 1 missing word    | Low overhead, fast for small searches           |
+| Mode     | Best For       | Notes                                             |
+| -------- | -------------- | ------------------------------------------------- |
+| `auto`   | Any            | Auto-selects best available (CUDA > OpenCL > CPU) |
+| `gpu`    | Any GPU        | Uses best available GPU backend                   |
+| `cuda`   | NVIDIA GPUs    | Forces CUDA backend                               |
+| `opencl` | Intel/AMD GPUs | Forces OpenCL backend                             |
+| `cpu`    | 1 missing word | Low overhead, fast for small searches             |
 
 ## How It Works
 
@@ -336,6 +422,13 @@ Possible reasons:
 - Reduce batch size (edit `batch_size` in code)
 - Close other GPU applications
 - Use `--device cpu` to fall back to CPU mode
+
+### State/Resume Issues
+
+- **"No saved state found"**: No previous session exists; start a new one with `-p`, `-a`, `-b`
+- **State file corrupted**: Delete `.wallet_recovery_state.json` and start fresh
+- **Wrong session resumed**: Use `--show-state` to verify, or use `--state-file` to specify the correct file
+- **Want to start over**: Use `--clear-state` flag to remove saved state
 
 ## Dependencies
 

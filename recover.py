@@ -15,7 +15,12 @@ Supports NVIDIA GPUs (CUDA) and Intel/AMD GPUs (OpenCL).
 import argparse
 import hashlib
 import itertools
+import json
+import os
+import signal
 import sys
+import time
+from dataclasses import dataclass, asdict
 from multiprocessing import Pool, cpu_count, Manager
 from typing import Optional, List, Tuple
 
@@ -193,6 +198,96 @@ missing_indices = None
 found_result = None
 mnemonic_validator = None
 skip_checksum_validation = False
+
+# State management for resumable sessions
+DEFAULT_STATE_FILE = ".wallet_recovery_state.json"
+SAVE_INTERVAL = 10000  # Save state every N combinations
+_interrupt_requested = False
+
+
+@dataclass
+class RecoveryState:
+    """Holds the state of a recovery session for persistence."""
+    partial_phrase: str
+    address: str
+    blockchain: str
+    passphrase: str
+    device: str
+    processed_count: int
+    total_combinations: int
+    session_id: str
+    start_time: float
+    elapsed_time: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RecoveryState":
+        return cls(**data)
+
+
+def generate_session_id(partial_phrase: str, address: str, blockchain: str) -> str:
+    """Generate a unique session ID based on recovery parameters."""
+    key = f"{partial_phrase}:{address}:{blockchain}"
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def save_state(state: RecoveryState, state_file: str = DEFAULT_STATE_FILE) -> None:
+    """Save recovery state to file."""
+    try:
+        with open(state_file, "w") as f:
+            json.dump(state.to_dict(), f, indent=2)
+    except Exception as e:
+        print(f"\nWarning: Failed to save state: {e}")
+
+
+def load_state(state_file: str = DEFAULT_STATE_FILE) -> Optional[RecoveryState]:
+    """Load recovery state from file."""
+    try:
+        if os.path.exists(state_file):
+            with open(state_file, "r") as f:
+                data = json.load(f)
+                return RecoveryState.from_dict(data)
+    except Exception as e:
+        print(f"Warning: Failed to load state: {e}")
+    return None
+
+
+def clear_state(state_file: str = DEFAULT_STATE_FILE) -> None:
+    """Clear the state file."""
+    try:
+        if os.path.exists(state_file):
+            os.remove(state_file)
+    except Exception:
+        pass
+
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    global _interrupt_requested
+    if _interrupt_requested:
+        # Second interrupt - force exit
+        print("\n\nForce exiting...")
+        sys.exit(1)
+    _interrupt_requested = True
+    print("\n\nInterrupt received. Saving state and exiting gracefully...")
+    print("(Press Ctrl+C again to force exit)")
+
+
+def setup_signal_handlers():
+    """Setup signal handlers for graceful interrupts."""
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+
+def skip_combinations(generator, count: int):
+    """Skip N combinations from the generator."""
+    for _ in range(count):
+        try:
+            next(generator)
+        except StopIteration:
+            break
 
 
 def compute_valid_last_words(known_words: List[str], wordlist: List[str]) -> List[str]:
@@ -528,6 +623,9 @@ def recover_phrase_cuda(
     blockchain_name: str,
     workers: int = None,
     passphrase: str = "",
+    start_offset: int = 0,
+    state_file: str = DEFAULT_STATE_FILE,
+    state: RecoveryState = None,
 ) -> Optional[str]:
     """
     CUDA GPU-accelerated recovery of missing words from a partial mnemonic.
@@ -540,10 +638,15 @@ def recover_phrase_cuda(
         blockchain_name: Blockchain name
         workers: Number of CPU workers for address derivation
         passphrase: Optional BIP-39 passphrase
+        start_offset: Number of combinations to skip (for resuming)
+        state_file: Path to state file for persistence
+        state: Existing state object (for resuming)
 
     Returns:
         Recovered mnemonic or None
     """
+    global _interrupt_requested
+
     if workers is None:
         workers = cpu_count()
 
@@ -605,10 +708,12 @@ def recover_phrase_cuda(
         print(f"Optimization:     Last-word entropy constraint applied")
         print(f"Valid Candidates: {len(word_candidates[0])} (reduced from 2048)")
     print(f"Total Attempts:   {total_combinations:,}")
+    if start_offset > 0:
+        print(f"Resuming from:    {start_offset:,} ({100*start_offset/total_combinations:.1f}%)")
     print(f"CPU Workers:      {workers}")
     print(f"{'='*60}\n")
 
-    if missing_count > 3:
+    if missing_count > 3 and start_offset == 0:
         print("WARNING: More than 3 missing words will take extremely long!")
         response = input("Continue? (yes/no): ")
         if response.lower() != "yes":
@@ -628,13 +733,35 @@ def recover_phrase_cuda(
     # Generate combinations in batches
     combo_generator = itertools.product(*word_candidates)
 
+    # Skip already processed combinations if resuming
+    if start_offset > 0:
+        print(f"Skipping {start_offset:,} already processed combinations...")
+        skip_combinations(combo_generator, start_offset)
+
     # Setup for address verification
     validator = Bip39MnemonicValidator(Bip39Languages.ENGLISH)
 
-    with tqdm(total=total_combinations, desc="Checking (GPU)", unit="combo") as pbar:
-        processed = 0
+    # Initialize or update state
+    if state is None:
+        session_id = generate_session_id(partial_phrase, address, blockchain_name)
+        state = RecoveryState(
+            partial_phrase=partial_phrase,
+            address=address,
+            blockchain=blockchain_name,
+            passphrase=passphrase,
+            device="cuda",
+            processed_count=start_offset,
+            total_combinations=total_combinations,
+            session_id=session_id,
+            start_time=time.time(),
+        )
 
-        while processed < total_combinations:
+    last_save_count = start_offset
+
+    with tqdm(total=total_combinations, desc="Checking (CUDA)", unit="combo", initial=start_offset) as pbar:
+        processed = start_offset
+
+        while processed < total_combinations and not _interrupt_requested:
             # Collect batch of combinations
             batch_combos = []
             for _ in range(min(batch_size, total_combinations - processed)):
@@ -704,10 +831,28 @@ def recover_phrase_cuda(
                 derived_normalized = derived.lower() if derived.startswith("0x") else derived
 
                 if derived_normalized == addr_normalized:
+                    # Clear state on success
+                    clear_state(state_file)
                     return mnemonic_str
 
             processed += current_batch_size
             pbar.update(current_batch_size)
+
+            # Periodically save state
+            if processed - last_save_count >= SAVE_INTERVAL:
+                state.processed_count = processed
+                state.elapsed_time = time.time() - state.start_time
+                save_state(state, state_file)
+                last_save_count = processed
+
+    # Save final state if interrupted
+    if _interrupt_requested:
+        state.processed_count = processed
+        state.elapsed_time = time.time() - state.start_time
+        save_state(state, state_file)
+        print(f"\nState saved. Processed {processed:,} of {total_combinations:,} combinations.")
+        print(f"Run with --resume to continue from where you left off.")
+        return None
 
     return None
 
@@ -919,6 +1064,9 @@ def recover_phrase_opencl(
     blockchain_name: str,
     workers: int = None,
     passphrase: str = "",
+    start_offset: int = 0,
+    state_file: str = DEFAULT_STATE_FILE,
+    state: RecoveryState = None,
 ) -> Optional[str]:
     """
     OpenCL GPU-accelerated recovery of missing words from a partial mnemonic.
@@ -932,10 +1080,15 @@ def recover_phrase_opencl(
         blockchain_name: Blockchain name
         workers: Number of CPU workers for address derivation
         passphrase: Optional BIP-39 passphrase
+        start_offset: Number of combinations to skip (for resuming)
+        state_file: Path to state file for persistence
+        state: Existing state object (for resuming)
 
     Returns:
         Recovered mnemonic or None
     """
+    global _interrupt_requested
+
     import pyopencl as cl
 
     if workers is None:
@@ -1005,10 +1158,12 @@ def recover_phrase_opencl(
         print(f"Optimization:     Last-word entropy constraint applied")
         print(f"Valid Candidates: {len(word_candidates[0])} (reduced from 2048)")
     print(f"Total Attempts:   {total_combinations:,}")
+    if start_offset > 0:
+        print(f"Resuming from:    {start_offset:,} ({100*start_offset/total_combinations:.1f}%)")
     print(f"CPU Workers:      {workers}")
     print(f"{'='*60}\n")
 
-    if missing_count > 3:
+    if missing_count > 3 and start_offset == 0:
         print("WARNING: More than 3 missing words will take extremely long!")
         response = input("Continue? (yes/no): ")
         if response.lower() != "yes":
@@ -1035,13 +1190,35 @@ def recover_phrase_opencl(
     # Generate combinations in batches
     combo_generator = itertools.product(*word_candidates)
 
+    # Skip already processed combinations if resuming
+    if start_offset > 0:
+        print(f"Skipping {start_offset:,} already processed combinations...")
+        skip_combinations(combo_generator, start_offset)
+
     # Setup for address verification
     validator = Bip39MnemonicValidator(Bip39Languages.ENGLISH)
 
-    with tqdm(total=total_combinations, desc="Checking (OpenCL)", unit="combo") as pbar:
-        processed = 0
+    # Initialize or update state
+    if state is None:
+        session_id = generate_session_id(partial_phrase, address, blockchain_name)
+        state = RecoveryState(
+            partial_phrase=partial_phrase,
+            address=address,
+            blockchain=blockchain_name,
+            passphrase=passphrase,
+            device="opencl",
+            processed_count=start_offset,
+            total_combinations=total_combinations,
+            session_id=session_id,
+            start_time=time.time(),
+        )
 
-        while processed < total_combinations:
+    last_save_count = start_offset
+
+    with tqdm(total=total_combinations, desc="Checking (OpenCL)", unit="combo", initial=start_offset) as pbar:
+        processed = start_offset
+
+        while processed < total_combinations and not _interrupt_requested:
             # Collect batch of combinations
             batch_combos = []
             for _ in range(min(batch_size, total_combinations - processed)):
@@ -1111,10 +1288,28 @@ def recover_phrase_opencl(
                 derived_normalized = derived.lower() if derived.startswith("0x") else derived
 
                 if derived_normalized == addr_normalized:
+                    # Clear state on success
+                    clear_state(state_file)
                     return mnemonic_str
 
             processed += current_batch_size
             pbar.update(current_batch_size)
+
+            # Periodically save state
+            if processed - last_save_count >= SAVE_INTERVAL:
+                state.processed_count = processed
+                state.elapsed_time = time.time() - state.start_time
+                save_state(state, state_file)
+                last_save_count = processed
+
+    # Save final state if interrupted
+    if _interrupt_requested:
+        state.processed_count = processed
+        state.elapsed_time = time.time() - state.start_time
+        save_state(state, state_file)
+        print(f"\nState saved. Processed {processed:,} of {total_combinations:,} combinations.")
+        print(f"Run with --resume to continue from where you left off.")
+        return None
 
     return None
 
@@ -1125,6 +1320,9 @@ def recover_phrase_cpu(
     blockchain_name: str,
     workers: int = None,
     passphrase: str = "",
+    start_offset: int = 0,
+    state_file: str = DEFAULT_STATE_FILE,
+    state: RecoveryState = None,
 ) -> Optional[str]:
     """
     CPU-based recovery of missing words from a partial mnemonic.
@@ -1137,10 +1335,15 @@ def recover_phrase_cpu(
         blockchain_name: Blockchain name
         workers: Number of parallel workers (default: CPU count)
         passphrase: Optional BIP-39 passphrase
+        start_offset: Number of combinations to skip (for resuming)
+        state_file: Path to state file for persistence
+        state: Existing state object (for resuming)
 
     Returns:
         Recovered mnemonic or None
     """
+    global _interrupt_requested
+
     if workers is None:
         workers = cpu_count()
 
@@ -1190,10 +1393,12 @@ def recover_phrase_cpu(
         print(f"Optimization:     Last-word entropy constraint applied")
         print(f"Valid Candidates: {len(word_candidates[0])} (reduced from 2048)")
     print(f"Total Attempts:   {total_combinations:,}")
+    if start_offset > 0:
+        print(f"Resuming from:    {start_offset:,} ({100*start_offset/total_combinations:.1f}%)")
     print(f"Workers:          {workers}")
     print(f"{'='*60}\n")
 
-    if missing_count > 3:
+    if missing_count > 3 and start_offset == 0:
         print("WARNING: More than 3 missing words will take extremely long!")
         response = input("Continue? (yes/no): ")
         if response.lower() != "yes":
@@ -1208,29 +1413,81 @@ def recover_phrase_cpu(
     # Normalize target address
     addr_normalized = address.lower() if address.startswith("0x") else address
 
+    # Create combination generator and skip already processed
+    combo_generator = itertools.product(*word_candidates)
+    if start_offset > 0:
+        print(f"Skipping {start_offset:,} already processed combinations...")
+        skip_combinations(combo_generator, start_offset)
+
+    # Initialize or update state
+    if state is None:
+        session_id = generate_session_id(partial_phrase, address, blockchain_name)
+        state = RecoveryState(
+            partial_phrase=partial_phrase,
+            address=address,
+            blockchain=blockchain_name,
+            passphrase=passphrase,
+            device="cpu",
+            processed_count=start_offset,
+            total_combinations=total_combinations,
+            session_id=session_id,
+            start_time=time.time(),
+        )
+
+    processed = start_offset
+    last_save_count = start_offset
+
     # Process combinations in parallel with progress bar
-    with Pool(
-        processes=workers,
-        initializer=init_worker,
-        initargs=(wl, addr_normalized, blockchain_name, template, indices, result_dict, optimization_applied),
-    ) as pool:
-        with tqdm(total=total_combinations, desc="Checking (CPU)", unit="combo") as pbar:
-            chunk_size = max(1, min(10000, total_combinations // (workers * 10)))
+    try:
+        with Pool(
+            processes=workers,
+            initializer=init_worker,
+            initargs=(wl, addr_normalized, blockchain_name, template, indices, result_dict, optimization_applied),
+        ) as pool:
+            with tqdm(total=total_combinations, desc="Checking (CPU)", unit="combo", initial=start_offset) as pbar:
+                chunk_size = max(1, min(10000, total_combinations // (workers * 10)))
 
-            for result in pool.imap_unordered(
-                check_combination,
-                itertools.product(*word_candidates),
-                chunksize=chunk_size,
-            ):
-                pbar.update(1)
+                for result in pool.imap_unordered(
+                    check_combination,
+                    combo_generator,
+                    chunksize=chunk_size,
+                ):
+                    processed += 1
+                    pbar.update(1)
 
-                if result is not None:
-                    pool.terminate()
-                    return result
+                    # Periodically save state
+                    if processed - last_save_count >= SAVE_INTERVAL:
+                        state.processed_count = processed
+                        state.elapsed_time = time.time() - state.start_time
+                        save_state(state, state_file)
+                        last_save_count = processed
 
-                if result_dict.get("found"):
-                    pool.terminate()
-                    return result_dict.get("phrase")
+                    # Check for interrupt
+                    if _interrupt_requested:
+                        pool.terminate()
+                        break
+
+                    if result is not None:
+                        pool.terminate()
+                        clear_state(state_file)
+                        return result
+
+                    if result_dict.get("found"):
+                        pool.terminate()
+                        clear_state(state_file)
+                        return result_dict.get("phrase")
+
+    except KeyboardInterrupt:
+        pass  # Signal handler will set _interrupt_requested
+
+    # Save final state if interrupted
+    if _interrupt_requested:
+        state.processed_count = processed
+        state.elapsed_time = time.time() - state.start_time
+        save_state(state, state_file)
+        print(f"\nState saved. Processed {processed:,} of {total_combinations:,} combinations.")
+        print(f"Run with --resume to continue from where you left off.")
+        return None
 
     return None
 
@@ -1242,6 +1499,9 @@ def recover_phrase(
     workers: int = None,
     passphrase: str = "",
     device: str = "auto",
+    start_offset: int = 0,
+    state_file: str = DEFAULT_STATE_FILE,
+    state: RecoveryState = None,
 ) -> Optional[str]:
     """
     Attempt to recover missing words from a partial mnemonic.
@@ -1255,6 +1515,9 @@ def recover_phrase(
         workers: Number of parallel workers (default: CPU count)
         passphrase: Optional BIP-39 passphrase
         device: Device to use ('auto', 'cpu', 'gpu', 'cuda', 'opencl')
+        start_offset: Number of combinations to skip (for resuming)
+        state_file: Path to state file for persistence
+        state: Existing state object (for resuming)
 
     Returns:
         Recovered mnemonic or None
@@ -1291,15 +1554,18 @@ def recover_phrase(
     # Execute with selected backend
     if backend == "cuda":
         return recover_phrase_cuda(
-            partial_phrase, address, blockchain_name, workers, passphrase
+            partial_phrase, address, blockchain_name, workers, passphrase,
+            start_offset, state_file, state
         )
     elif backend == "opencl":
         return recover_phrase_opencl(
-            partial_phrase, address, blockchain_name, workers, passphrase
+            partial_phrase, address, blockchain_name, workers, passphrase,
+            start_offset, state_file, state
         )
     else:
         return recover_phrase_cpu(
-            partial_phrase, address, blockchain_name, workers, passphrase
+            partial_phrase, address, blockchain_name, workers, passphrase,
+            start_offset, state_file, state
         )
 
 
@@ -1329,28 +1595,39 @@ Examples:
   # Force CPU mode
   python recover.py -p "? word2 ..." -a "0x..." -b ethereum --device cpu
 
+  # Resume an interrupted session
+  python recover.py --resume
+
+  # Resume from a custom state file
+  python recover.py --resume --state-file my_state.json
+
+  # Clear saved state and start fresh
+  python recover.py -p "..." -a "..." -b ethereum --clear-state
+
 Supported blockchains:
   bitcoin, bitcoin_segwit, bitcoin_native_segwit, ethereum, tron, bsc, litecoin, dogecoin, solana
 
 Supported GPU backends:
   - CUDA: NVIDIA GPUs (requires numba + CUDA toolkit)
   - OpenCL: Intel/AMD/NVIDIA GPUs (requires pyopencl + OpenCL runtime)
+
+State Management:
+  The script automatically saves progress periodically. If interrupted (Ctrl+C),
+  you can resume from where you left off using --resume. State is saved to
+  .wallet_recovery_state.json by default.
         """,
     )
 
     parser.add_argument(
         "-p", "--phrase",
-        required=True,
         help="Partial mnemonic phrase with '?' for missing words",
     )
     parser.add_argument(
         "-a", "--address",
-        required=True,
         help="Known wallet address to match",
     )
     parser.add_argument(
         "-b", "--blockchain",
-        required=True,
         choices=list(BLOCKCHAIN_CONFIG.keys()),
         help="Blockchain type",
     )
@@ -1376,8 +1653,88 @@ Supported GPU backends:
         default="auto",
         help="Device to use for computation: auto (default), cpu, gpu (best available), cuda (NVIDIA), opencl (Intel/AMD)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from a previously interrupted session",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=DEFAULT_STATE_FILE,
+        help=f"State file for saving/resuming progress (default: {DEFAULT_STATE_FILE})",
+    )
+    parser.add_argument(
+        "--clear-state",
+        action="store_true",
+        help="Clear any saved state and start fresh",
+    )
+    parser.add_argument(
+        "--show-state",
+        action="store_true",
+        help="Show saved state information and exit",
+    )
 
     args = parser.parse_args()
+
+    # Handle --show-state
+    if args.show_state:
+        state = load_state(args.state_file)
+        if state:
+            elapsed = state.elapsed_time
+            hours, remainder = divmod(int(elapsed), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            print(f"\nSaved Recovery State ({args.state_file}):")
+            print(f"{'='*60}")
+            print(f"Session ID:       {state.session_id}")
+            print(f"Phrase:           {state.partial_phrase}")
+            print(f"Address:          {state.address}")
+            print(f"Blockchain:       {state.blockchain}")
+            print(f"Device:           {state.device}")
+            print(f"Progress:         {state.processed_count:,} / {state.total_combinations:,}")
+            print(f"Percentage:       {100*state.processed_count/state.total_combinations:.2f}%")
+            print(f"Elapsed Time:     {hours}h {minutes}m {seconds}s")
+            print(f"{'='*60}")
+            print("\nUse --resume to continue this session.")
+        else:
+            print(f"No saved state found at {args.state_file}")
+        sys.exit(0)
+
+    # Handle --clear-state
+    if args.clear_state:
+        clear_state(args.state_file)
+        print(f"Cleared saved state from {args.state_file}")
+
+    # Handle --resume
+    state = None
+    start_offset = 0
+    if args.resume:
+        state = load_state(args.state_file)
+        if state:
+            print(f"\nResuming previous session (ID: {state.session_id})")
+            print(f"Progress: {state.processed_count:,} / {state.total_combinations:,} ({100*state.processed_count/state.total_combinations:.1f}%)")
+            # Use parameters from saved state
+            args.phrase = state.partial_phrase
+            args.address = state.address
+            args.blockchain = state.blockchain
+            args.passphrase = state.passphrase
+            args.device = state.device
+            start_offset = state.processed_count
+        else:
+            print(f"No saved state found at {args.state_file}")
+            print("Cannot resume. Please start a new session with -p, -a, -b options.")
+            sys.exit(1)
+
+    # Validate required arguments if not resuming
+    if not args.resume or state is None:
+        if not args.phrase:
+            parser.error("the following arguments are required: -p/--phrase")
+        if not args.address:
+            parser.error("the following arguments are required: -a/--address")
+        if not args.blockchain:
+            parser.error("the following arguments are required: -b/--blockchain")
+
+    # Setup signal handlers for graceful interrupts
+    setup_signal_handlers()
 
     # Show device info
     print("GPU Backend Detection:")
@@ -1416,6 +1773,9 @@ Supported GPU backends:
         workers=args.workers,
         passphrase=args.passphrase,
         device=args.device,
+        start_offset=start_offset,
+        state_file=args.state_file,
+        state=state,
     )
 
     if result:
@@ -1429,6 +1789,14 @@ Supported GPU backends:
         with open(args.output, "w") as f:
             f.write(result + "\n")
         print(f"Saved to: {args.output}")
+
+        # Clear state on success
+        clear_state(args.state_file)
+    elif _interrupt_requested:
+        # Interrupted - state already saved
+        print("\nSession interrupted. State has been saved.")
+        print(f"Use 'python recover.py --resume' to continue.")
+        sys.exit(130)  # Standard exit code for SIGINT
     else:
         print(f"\n{'='*60}")
         print("FAILED: No matching phrase found")
@@ -1438,6 +1806,9 @@ Supported GPU backends:
         print("  - Wrong address")
         print("  - More words are missing than indicated")
         print("  - Non-standard derivation path used")
+
+        # Clear state since we exhausted all combinations
+        clear_state(args.state_file)
         sys.exit(1)
 
 

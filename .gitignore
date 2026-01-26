@@ -1,3 +1,4 @@
 recovered_phrase.txt
 venv/
 __pycache__/
+.wallet_recovery_state.json
