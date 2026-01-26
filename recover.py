@@ -8,7 +8,8 @@ possible combinations and checking against a known wallet address.
 Supports: Bitcoin (BTC), Ethereum (ETH), TRON (TRX), Binance Smart Chain (BSC),
 Litecoin (LTC), Dogecoin (DOGE), and more.
 
-Features GPU acceleration (CUDA) with automatic CPU fallback.
+Features GPU acceleration (CUDA/OpenCL) with automatic CPU fallback.
+Supports NVIDIA GPUs (CUDA) and Intel/AMD GPUs (OpenCL).
 """
 
 import argparse
@@ -35,8 +36,14 @@ from bip_utils import (
     Bip44Changes,
 )
 
-# Try to import GPU libraries
+# GPU backend detection
+CUDA_AVAILABLE = False
+OPENCL_AVAILABLE = False
 GPU_AVAILABLE = False
+GPU_NAME = "None"
+GPU_BACKEND = None  # 'cuda', 'opencl', or None
+
+# Try to import CUDA libraries (NVIDIA)
 try:
     import numpy as np
     from numba import cuda
@@ -44,9 +51,55 @@ try:
 
     # Check if CUDA is actually available
     if cuda.is_available():
+        CUDA_AVAILABLE = True
         GPU_AVAILABLE = True
-        # Get GPU info
         GPU_NAME = cuda.get_current_device().name
+        GPU_BACKEND = "cuda"
+except ImportError:
+    pass
+except Exception:
+    pass
+
+# Try to import OpenCL libraries (Intel, AMD, and also NVIDIA)
+try:
+    import numpy as np
+    import pyopencl as cl
+
+    # Find available OpenCL platforms and devices
+    OPENCL_PLATFORMS = []
+    OPENCL_DEVICES = []
+
+    for platform in cl.get_platforms():
+        for device in platform.get_devices():
+            device_type = device.type
+            device_name = device.name.strip()
+            vendor = device.vendor.strip()
+
+            # Store device info
+            OPENCL_DEVICES.append({
+                "platform": platform,
+                "device": device,
+                "name": device_name,
+                "vendor": vendor,
+                "type": device_type,
+            })
+
+            # Prefer Intel/AMD GPU over CPU, but don't override CUDA if available
+            if device_type == cl.device_type.GPU:
+                if not CUDA_AVAILABLE:
+                    OPENCL_AVAILABLE = True
+                    GPU_AVAILABLE = True
+                    GPU_NAME = device_name
+                    GPU_BACKEND = "opencl"
+                elif "Intel" in vendor or "AMD" in vendor:
+                    # Also track Intel/AMD GPU even if CUDA is available
+                    # User can explicitly choose OpenCL
+                    OPENCL_AVAILABLE = True
+
+    # If no GPU found but OpenCL CPU is available, note it (but don't use by default)
+    if not GPU_AVAILABLE and OPENCL_DEVICES:
+        OPENCL_AVAILABLE = True
+
 except ImportError:
     pass
 except Exception:
@@ -301,10 +354,10 @@ def check_combination(word_combo: tuple) -> Optional[str]:
 
 
 # ============================================================================
-# GPU-accelerated functions
+# GPU-accelerated functions (CUDA - NVIDIA)
 # ============================================================================
 
-if GPU_AVAILABLE:
+if CUDA_AVAILABLE:
     # SHA-256 constants as numpy array for GPU
     SHA256_K_GPU = np.array(SHA256_K, dtype=np.uint32)
 
@@ -469,7 +522,7 @@ if GPU_AVAILABLE:
             valid_flags[idx] = 0
 
 
-def recover_phrase_gpu(
+def recover_phrase_cuda(
     partial_phrase: str,
     address: str,
     blockchain_name: str,
@@ -477,9 +530,9 @@ def recover_phrase_gpu(
     passphrase: str = "",
 ) -> Optional[str]:
     """
-    GPU-accelerated recovery of missing words from a partial mnemonic.
+    CUDA GPU-accelerated recovery of missing words from a partial mnemonic.
 
-    Uses GPU for batch checksum validation, then CPU for address derivation.
+    Uses NVIDIA GPU for batch checksum validation, then CPU for address derivation.
 
     Args:
         partial_phrase: Mnemonic with '?' for missing words
@@ -541,7 +594,7 @@ def recover_phrase_gpu(
         total_combinations *= len(candidates)
 
     print(f"\n{'='*60}")
-    print(f"BIP-39 Mnemonic Recovery (GPU Mode)")
+    print(f"BIP-39 Mnemonic Recovery (CUDA Mode)")
     print(f"{'='*60}")
     print(f"GPU Device:       {GPU_NAME}")
     print(f"Blockchain:       {blockchain_name}")
@@ -637,6 +690,413 @@ def recover_phrase_gpu(
                 mnemonic_str = " ".join(phrase)
 
                 # Double-check validity (should always pass)
+                try:
+                    if not validator.IsValid(mnemonic_str):
+                        continue
+                except Exception:
+                    continue
+
+                # Derive address
+                derived = derive_address(mnemonic_str, blockchain_name)
+                if derived is None:
+                    continue
+
+                derived_normalized = derived.lower() if derived.startswith("0x") else derived
+
+                if derived_normalized == addr_normalized:
+                    return mnemonic_str
+
+            processed += current_batch_size
+            pbar.update(current_batch_size)
+
+    return None
+
+
+# ============================================================================
+# GPU-accelerated functions (OpenCL - Intel, AMD, NVIDIA)
+# ============================================================================
+
+# OpenCL kernel for SHA-256 checksum validation
+OPENCL_KERNEL_SOURCE = """
+__constant uint K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+inline uint rotr(uint x, uint n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+__kernel void validate_checksums(
+    __global const uint *word_indices,      // [n_combos * n_missing]
+    __global const uint *template_indices,  // [phrase_len]
+    __global const uint *missing_positions, // [n_missing]
+    __global uint *valid_flags,             // [n_combos]
+    const uint n_missing,
+    const uint phrase_len,
+    const uint entropy_bits,
+    const uint checksum_bits
+) {
+    uint idx = get_global_id(0);
+
+    // Build complete phrase indices
+    uint phrase_indices[24];  // Max 24 words
+    for (uint i = 0; i < phrase_len; i++) {
+        phrase_indices[i] = template_indices[i];
+    }
+
+    // Fill in missing words from this combination
+    for (uint i = 0; i < n_missing; i++) {
+        uint pos = missing_positions[i];
+        phrase_indices[pos] = word_indices[idx * n_missing + i];
+    }
+
+    // Create entropy byte array
+    uchar entropy[32];
+    for (uint i = 0; i < 32; i++) {
+        entropy[i] = 0;
+    }
+
+    // Pack word indices into entropy bytes (11 bits per word)
+    uint bit_pos = 0;
+    for (uint i = 0; i < phrase_len; i++) {
+        uint word_idx = phrase_indices[i];
+        for (uint b = 0; b < 11; b++) {
+            if (bit_pos < entropy_bits) {
+                uint bit_val = (word_idx >> (10 - b)) & 1;
+                uint byte_idx = bit_pos / 8;
+                uint bit_offset = 7 - (bit_pos % 8);
+                entropy[byte_idx] |= (bit_val << bit_offset);
+            }
+            bit_pos++;
+        }
+    }
+
+    uint entropy_bytes_len = entropy_bits / 8;
+
+    // SHA-256 initialization
+    uint state[8];
+    state[0] = 0x6a09e667;
+    state[1] = 0xbb67ae85;
+    state[2] = 0x3c6ef372;
+    state[3] = 0xa54ff53a;
+    state[4] = 0x510e527f;
+    state[5] = 0x9b05688c;
+    state[6] = 0x1f83d9ab;
+    state[7] = 0x5be0cd19;
+
+    // Prepare padded message block
+    uint block[16];
+    for (uint i = 0; i < 16; i++) {
+        block[i] = 0;
+    }
+
+    // Copy entropy bytes to block (big-endian)
+    for (uint i = 0; i < entropy_bytes_len; i++) {
+        uint word_idx_blk = i / 4;
+        uint byte_offset = 3 - (i % 4);
+        block[word_idx_blk] |= ((uint)entropy[i]) << (byte_offset * 8);
+    }
+
+    // Add padding bit
+    uint pad_byte_idx = entropy_bytes_len;
+    uint pad_word_idx = pad_byte_idx / 4;
+    uint pad_byte_offset = 3 - (pad_byte_idx % 4);
+    block[pad_word_idx] |= 0x80 << (pad_byte_offset * 8);
+
+    // Add length in bits
+    block[15] = entropy_bits;
+
+    // SHA-256 compression
+    uint w[64];
+    for (uint i = 0; i < 16; i++) {
+        w[i] = block[i];
+    }
+    for (uint i = 16; i < 64; i++) {
+        uint s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+
+    uint a = state[0], b = state[1], c = state[2], d = state[3];
+    uint e = state[4], f = state[5], g = state[6], h = state[7];
+
+    for (uint i = 0; i < 64; i++) {
+        uint S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        uint ch = (e & f) ^ ((~e) & g);
+        uint temp1 = h + S1 + ch + K[i] + w[i];
+        uint S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        uint maj = (a & b) ^ (a & c) ^ (b & c);
+        uint temp2 = S0 + maj;
+
+        h = g; g = f; f = e; e = d + temp1;
+        d = c; c = b; b = a; a = temp1 + temp2;
+    }
+
+    state[0] += a;
+
+    // Extract checksum from hash
+    uint hash_first_byte = (state[0] >> 24) & 0xFF;
+    uint computed_checksum = hash_first_byte >> (8 - checksum_bits);
+
+    // Extract checksum from mnemonic
+    uint last_word_idx = phrase_indices[phrase_len - 1];
+    uint mnemonic_checksum = last_word_idx & ((1 << checksum_bits) - 1);
+
+    valid_flags[idx] = (computed_checksum == mnemonic_checksum) ? 1 : 0;
+}
+"""
+
+
+def get_opencl_device(prefer_gpu: bool = True):
+    """
+    Get the best available OpenCL device.
+
+    Args:
+        prefer_gpu: If True, prefer GPU over CPU
+
+    Returns:
+        Tuple of (context, queue, device_name) or (None, None, None)
+    """
+    if not OPENCL_AVAILABLE:
+        return None, None, None
+
+    try:
+        import pyopencl as cl
+
+        best_device = None
+        best_device_info = None
+
+        for device_info in OPENCL_DEVICES:
+            device = device_info["device"]
+            is_gpu = device_info["type"] == cl.device_type.GPU
+
+            if prefer_gpu:
+                if is_gpu:
+                    # Prefer Intel/AMD GPU over others for OpenCL
+                    if best_device is None or "Intel" in device_info["vendor"] or "AMD" in device_info["vendor"]:
+                        best_device = device
+                        best_device_info = device_info
+            else:
+                # Just take any device
+                if best_device is None:
+                    best_device = device
+                    best_device_info = device_info
+
+        if best_device is None and OPENCL_DEVICES:
+            # Fallback to first available device
+            best_device = OPENCL_DEVICES[0]["device"]
+            best_device_info = OPENCL_DEVICES[0]
+
+        if best_device:
+            ctx = cl.Context([best_device])
+            queue = cl.CommandQueue(ctx)
+            return ctx, queue, best_device_info["name"]
+
+    except Exception:
+        pass
+
+    return None, None, None
+
+
+def recover_phrase_opencl(
+    partial_phrase: str,
+    address: str,
+    blockchain_name: str,
+    workers: int = None,
+    passphrase: str = "",
+) -> Optional[str]:
+    """
+    OpenCL GPU-accelerated recovery of missing words from a partial mnemonic.
+
+    Uses OpenCL (Intel/AMD/NVIDIA GPU) for batch checksum validation,
+    then CPU for address derivation.
+
+    Args:
+        partial_phrase: Mnemonic with '?' for missing words
+        address: Target wallet address
+        blockchain_name: Blockchain name
+        workers: Number of CPU workers for address derivation
+        passphrase: Optional BIP-39 passphrase
+
+    Returns:
+        Recovered mnemonic or None
+    """
+    import pyopencl as cl
+
+    if workers is None:
+        workers = cpu_count()
+
+    # Get OpenCL context and queue
+    ctx, queue, device_name = get_opencl_device(prefer_gpu=True)
+    if ctx is None:
+        print("ERROR: No OpenCL device available")
+        return None
+
+    # Load BIP-39 wordlist
+    mnemo = Mnemonic("english")
+    wl = mnemo.wordlist
+    word_to_idx = {word: idx for idx, word in enumerate(wl)}
+
+    # Parse phrase template
+    words = partial_phrase.strip().split()
+    template = words.copy()
+    indices = [i for i, w in enumerate(words) if w == "?"]
+
+    if not indices:
+        print("No missing words indicated (use '?' as placeholder)")
+        return None
+
+    phrase_len = len(words)
+    missing_count = len(indices)
+
+    if phrase_len not in PHRASE_CONFIG:
+        print(f"Error: Invalid phrase length {phrase_len}")
+        return None
+
+    entropy_bits, checksum_bits = PHRASE_CONFIG[phrase_len]
+
+    # Build template indices
+    template_indices = np.array(
+        [word_to_idx.get(w, 0) for w in words], dtype=np.uint32
+    )
+    missing_positions = np.array(indices, dtype=np.uint32)
+
+    # Determine word candidates
+    word_candidates = []
+    optimization_applied = False
+
+    for idx in indices:
+        if idx == phrase_len - 1 and missing_count == 1:
+            known_words = [w for w in words if w != "?"]
+            valid_words = compute_valid_last_words(known_words, wl)
+            word_candidates.append([word_to_idx[w] for w in valid_words])
+            optimization_applied = True
+        else:
+            word_candidates.append(list(range(2048)))
+
+    total_combinations = 1
+    for candidates in word_candidates:
+        total_combinations *= len(candidates)
+
+    print(f"\n{'='*60}")
+    print(f"BIP-39 Mnemonic Recovery (OpenCL Mode)")
+    print(f"{'='*60}")
+    print(f"GPU Device:       {device_name}")
+    print(f"Blockchain:       {blockchain_name}")
+    print(f"Target Address:   {address}")
+    print(f"Phrase Length:    {phrase_len} words")
+    print(f"Missing Words:    {missing_count} at position(s) {[i+1 for i in indices]}")
+    if optimization_applied:
+        print(f"Optimization:     Last-word entropy constraint applied")
+        print(f"Valid Candidates: {len(word_candidates[0])} (reduced from 2048)")
+    print(f"Total Attempts:   {total_combinations:,}")
+    print(f"CPU Workers:      {workers}")
+    print(f"{'='*60}\n")
+
+    if missing_count > 3:
+        print("WARNING: More than 3 missing words will take extremely long!")
+        response = input("Continue? (yes/no): ")
+        if response.lower() != "yes":
+            return None
+
+    # Normalize target address
+    addr_normalized = address.lower() if address.startswith("0x") else address
+
+    # Compile OpenCL kernel
+    try:
+        prg = cl.Program(ctx, OPENCL_KERNEL_SOURCE).build()
+    except cl.RuntimeError as e:
+        print(f"ERROR: Failed to compile OpenCL kernel: {e}")
+        return None
+
+    # GPU batch processing parameters
+    batch_size = min(500_000, total_combinations)  # Process up to 500K at a time
+
+    # Create OpenCL buffers for template and positions (these don't change)
+    mf = cl.mem_flags
+    template_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=template_indices)
+    positions_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=missing_positions)
+
+    # Generate combinations in batches
+    combo_generator = itertools.product(*word_candidates)
+
+    # Setup for address verification
+    validator = Bip39MnemonicValidator(Bip39Languages.ENGLISH)
+
+    with tqdm(total=total_combinations, desc="Checking (OpenCL)", unit="combo") as pbar:
+        processed = 0
+
+        while processed < total_combinations:
+            # Collect batch of combinations
+            batch_combos = []
+            for _ in range(min(batch_size, total_combinations - processed)):
+                try:
+                    combo = next(combo_generator)
+                    batch_combos.append(combo)
+                except StopIteration:
+                    break
+
+            if not batch_combos:
+                break
+
+            current_batch_size = len(batch_combos)
+
+            # Flatten word indices for OpenCL
+            word_indices = np.array(batch_combos, dtype=np.uint32).flatten()
+            valid_flags = np.zeros(current_batch_size, dtype=np.uint32)
+
+            # Create OpenCL buffers
+            word_indices_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=word_indices)
+            valid_flags_buf = cl.Buffer(ctx, mf.WRITE_ONLY, valid_flags.nbytes)
+
+            # Execute kernel
+            prg.validate_checksums(
+                queue,
+                (current_batch_size,),
+                None,  # Let OpenCL choose work group size
+                word_indices_buf,
+                template_buf,
+                positions_buf,
+                valid_flags_buf,
+                np.uint32(missing_count),
+                np.uint32(phrase_len),
+                np.uint32(entropy_bits),
+                np.uint32(checksum_bits),
+            )
+
+            # Read results back
+            cl.enqueue_copy(queue, valid_flags, valid_flags_buf)
+            queue.finish()
+
+            # Get valid combinations
+            valid_indices = np.where(valid_flags == 1)[0]
+
+            # Check valid combinations on CPU
+            for vi in valid_indices:
+                combo = batch_combos[vi]
+                # Build phrase
+                phrase = template.copy()
+                for pos_idx, word_idx in zip(indices, combo):
+                    phrase[pos_idx] = wl[word_idx]
+
+                mnemonic_str = " ".join(phrase)
+
+                # Double-check validity
                 try:
                     if not validator.IsValid(mnemonic_str):
                         continue
@@ -794,24 +1254,47 @@ def recover_phrase(
         blockchain_name: Blockchain name
         workers: Number of parallel workers (default: CPU count)
         passphrase: Optional BIP-39 passphrase
-        device: Device to use ('auto', 'cpu', 'gpu')
+        device: Device to use ('auto', 'cpu', 'gpu', 'cuda', 'opencl')
 
     Returns:
         Recovered mnemonic or None
     """
-    use_gpu = False
+    # Determine which backend to use
+    backend = None  # 'cuda', 'opencl', or None (CPU)
 
-    if device == "gpu":
-        if GPU_AVAILABLE:
-            use_gpu = True
+    if device == "cuda":
+        if CUDA_AVAILABLE:
+            backend = "cuda"
+        else:
+            print("WARNING: CUDA requested but not available. Falling back to CPU.")
+    elif device == "opencl":
+        if OPENCL_AVAILABLE:
+            backend = "opencl"
+        else:
+            print("WARNING: OpenCL requested but not available. Falling back to CPU.")
+    elif device == "gpu":
+        # Generic GPU request - prefer CUDA, then OpenCL
+        if CUDA_AVAILABLE:
+            backend = "cuda"
+        elif OPENCL_AVAILABLE:
+            backend = "opencl"
         else:
             print("WARNING: GPU requested but not available. Falling back to CPU.")
     elif device == "auto":
-        use_gpu = GPU_AVAILABLE
-    # device == "cpu" -> use_gpu = False
+        # Auto-detect best available backend
+        if CUDA_AVAILABLE:
+            backend = "cuda"
+        elif OPENCL_AVAILABLE:
+            backend = "opencl"
+        # else: backend remains None (CPU)
 
-    if use_gpu:
-        return recover_phrase_gpu(
+    # Execute with selected backend
+    if backend == "cuda":
+        return recover_phrase_cuda(
+            partial_phrase, address, blockchain_name, workers, passphrase
+        )
+    elif backend == "opencl":
+        return recover_phrase_opencl(
             partial_phrase, address, blockchain_name, workers, passphrase
         )
     else:
@@ -834,14 +1317,24 @@ Examples:
   python recover.py -p "? ? word3 word4 word5 word6 word7 word8 word9 word10 word11 word12" \\
                     -a "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2" -b bitcoin
 
-  # Force GPU mode
+  # Force GPU mode (auto-select best GPU backend)
   python recover.py -p "? word2 ..." -a "0x..." -b ethereum --device gpu
+
+  # Force CUDA (NVIDIA GPU)
+  python recover.py -p "? word2 ..." -a "0x..." -b ethereum --device cuda
+
+  # Force OpenCL (Intel/AMD GPU)
+  python recover.py -p "? word2 ..." -a "0x..." -b ethereum --device opencl
 
   # Force CPU mode
   python recover.py -p "? word2 ..." -a "0x..." -b ethereum --device cpu
 
 Supported blockchains:
   bitcoin, bitcoin_segwit, bitcoin_native_segwit, ethereum, tron, bsc, litecoin, dogecoin, solana
+
+Supported GPU backends:
+  - CUDA: NVIDIA GPUs (requires numba + CUDA toolkit)
+  - OpenCL: Intel/AMD/NVIDIA GPUs (requires pyopencl + OpenCL runtime)
         """,
     )
 
@@ -879,19 +1372,35 @@ Supported blockchains:
     )
     parser.add_argument(
         "-d", "--device",
-        choices=["auto", "cpu", "gpu"],
+        choices=["auto", "cpu", "gpu", "cuda", "opencl"],
         default="auto",
-        help="Device to use for computation (default: auto - uses GPU if available)",
+        help="Device to use for computation: auto (default), cpu, gpu (best available), cuda (NVIDIA), opencl (Intel/AMD)",
     )
 
     args = parser.parse_args()
 
     # Show device info
-    if args.device == "auto":
-        if GPU_AVAILABLE:
-            print(f"GPU detected: {GPU_NAME}")
+    print("GPU Backend Detection:")
+    if CUDA_AVAILABLE:
+        print(f"  - CUDA:   Available ({GPU_NAME if GPU_BACKEND == 'cuda' else 'NVIDIA GPU'})")
+    else:
+        print("  - CUDA:   Not available")
+    if OPENCL_AVAILABLE:
+        opencl_gpu_names = [d["name"] for d in OPENCL_DEVICES if d["type"] == 4]  # cl.device_type.GPU == 4
+        if opencl_gpu_names:
+            print(f"  - OpenCL: Available ({', '.join(opencl_gpu_names)})")
         else:
-            print("No GPU detected, using CPU")
+            print("  - OpenCL: Available (CPU only)")
+    else:
+        print("  - OpenCL: Not available")
+
+    if args.device == "auto":
+        if CUDA_AVAILABLE:
+            print(f"Selected: CUDA ({GPU_NAME})")
+        elif OPENCL_AVAILABLE:
+            print(f"Selected: OpenCL ({GPU_NAME})")
+        else:
+            print("Selected: CPU (no GPU available)")
 
     # Validate blockchain
     if args.blockchain not in BLOCKCHAIN_CONFIG:

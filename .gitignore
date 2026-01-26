@@ -1,2 +1,3 @@
 recovered_phrase.txt
 venv/
+__pycache__/

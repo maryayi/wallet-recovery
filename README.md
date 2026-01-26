@@ -6,7 +6,7 @@ A Python tool to recover missing words from BIP-39 mnemonic seed phrases by brut
 
 - **Multi-Blockchain Support**: Bitcoin, Ethereum, TRON, BSC, Litecoin, Dogecoin, Solana
 - **Multiple Bitcoin Address Formats**: Legacy, SegWit, Native SegWit
-- **GPU Acceleration**: CUDA support for massively parallel checksum validation (auto-detects GPU)
+- **GPU Acceleration**: CUDA (NVIDIA) and OpenCL (Intel/AMD) support for massively parallel checksum validation
 - **CPU Fallback**: Automatically falls back to multi-core CPU if no GPU available
 - **Fast Validation**: Checksum validation before address derivation for quick rejection
 - **Parallel Processing**: Multi-core CPU support for faster recovery
@@ -32,7 +32,9 @@ A Python tool to recover missing words from BIP-39 mnemonic seed phrases by brut
 ### Prerequisites
 
 - Python 3.8 or higher
-- (Optional) NVIDIA GPU with CUDA support for GPU acceleration
+- (Optional) GPU for acceleration:
+  - NVIDIA GPU with CUDA support, or
+  - Intel/AMD GPU with OpenCL support
 
 ### Setup
 
@@ -51,17 +53,33 @@ pip install -r requirements.txt
 
 ### GPU Support (Optional)
 
-For GPU acceleration, install the additional dependencies:
+#### NVIDIA GPU (CUDA)
 
 ```bash
 # Install CUDA toolkit first (if not already installed)
 # See: https://developer.nvidia.com/cuda-downloads
 
-# Install GPU dependencies
+# Install CUDA dependencies
 pip install numpy numba
 
-# Verify GPU is detected
-python -c "from numba import cuda; print('GPU:', cuda.get_current_device().name if cuda.is_available() else 'Not available')"
+# Verify CUDA is detected
+python -c "from numba import cuda; print('CUDA GPU:', cuda.get_current_device().name if cuda.is_available() else 'Not available')"
+```
+
+#### Intel/AMD GPU (OpenCL)
+
+```bash
+# Install OpenCL runtime
+# Ubuntu/Debian:
+sudo apt install intel-opencl-icd    # For Intel GPUs
+# or
+sudo apt install mesa-opencl-icd     # For AMD GPUs
+
+# Install OpenCL dependencies
+pip install numpy pyopencl
+
+# Verify OpenCL is detected
+python -c "import pyopencl as cl; print('OpenCL devices:', [d.name.strip() for p in cl.get_platforms() for d in p.get_devices()])"
 ```
 
 ## Usage
@@ -74,15 +92,15 @@ python recover.py -p "PHRASE" -a "ADDRESS" -b BLOCKCHAIN
 
 ### Arguments
 
-| Argument       | Short | Required | Description                                     |
-| -------------- | ----- | -------- | ----------------------------------------------- |
-| `--phrase`     | `-p`  | Yes      | Partial mnemonic with `?` for missing words     |
-| `--address`    | `-a`  | Yes      | Known wallet address to match                   |
-| `--blockchain` | `-b`  | Yes      | Blockchain type (see supported list)            |
-| `--device`     | `-d`  | No       | Device: `auto`, `cpu`, or `gpu` (default: auto) |
-| `--workers`    | `-w`  | No       | Number of CPU cores (default: all)              |
-| `--passphrase` |       | No       | Optional BIP-39 passphrase                      |
-| `--output`     | `-o`  | No       | Output file (default: `recovered_phrase.txt`)   |
+| Argument       | Short | Required | Description                                                            |
+| -------------- | ----- | -------- | ---------------------------------------------------------------------- |
+| `--phrase`     | `-p`  | Yes      | Partial mnemonic with `?` for missing words                            |
+| `--address`    | `-a`  | Yes      | Known wallet address to match                                          |
+| `--blockchain` | `-b`  | Yes      | Blockchain type (see supported list)                                   |
+| `--device`     | `-d`  | No       | Device: `auto`, `cpu`, `gpu`, `cuda`, or `opencl` (default: auto)      |
+| `--workers`    | `-w`  | No       | Number of CPU cores (default: all)                                     |
+| `--passphrase` |       | No       | Optional BIP-39 passphrase                                             |
+| `--output`     | `-o`  | No       | Output file (default: `recovered_phrase.txt`)                          |
 
 ### Examples
 
@@ -133,7 +151,7 @@ python recover.py \
   --passphrase "my secret passphrase"
 ```
 
-#### Force GPU Mode
+#### Force GPU Mode (auto-select best available)
 
 ```bash
 python recover.py \
@@ -141,6 +159,26 @@ python recover.py \
   -a "0x9858EfFD232B4033E47d90003D41EC34EcaEda94" \
   -b ethereum \
   --device gpu
+```
+
+#### Force CUDA (NVIDIA GPU)
+
+```bash
+python recover.py \
+  -p "? ? abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
+  -a "0x9858EfFD232B4033E47d90003D41EC34EcaEda94" \
+  -b ethereum \
+  --device cuda
+```
+
+#### Force OpenCL (Intel/AMD GPU)
+
+```bash
+python recover.py \
+  -p "? ? abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
+  -a "0x9858EfFD232B4033E47d90003D41EC34EcaEda94" \
+  -b ethereum \
+  --device opencl
 ```
 
 #### Force CPU Mode (disable GPU)
@@ -182,20 +220,33 @@ This optimization exploits BIP-39's checksum structure: the last word contains b
 
 ### GPU Acceleration
 
-When a CUDA-capable GPU is available, the tool uses GPU parallelism for checksum validation:
+The tool supports two GPU backends for parallel checksum validation:
+
+#### Supported GPU Backends
+
+| Backend | GPU Support       | Library    | Notes                              |
+| ------- | ----------------- | ---------- | ---------------------------------- |
+| CUDA    | NVIDIA            | numba      | Best performance on NVIDIA GPUs    |
+| OpenCL  | Intel, AMD, NVIDIA| pyopencl   | Cross-platform, works with integrated GPUs |
+
+#### How It Works
 
 - **Batch Processing**: Processes up to 1 million combinations per GPU batch
 - **Parallel SHA-256**: Validates checksums in parallel across thousands of GPU cores
 - **Hybrid Approach**: GPU handles checksum validation, CPU handles address derivation
-- **Auto-detection**: Automatically detects GPU and falls back to CPU if unavailable
+- **Auto-detection**: Automatically detects available GPUs and selects the best backend
 
 GPU mode is particularly effective for 2+ missing words where checksum validation becomes the bottleneck.
 
-| Mode | Best For          | Notes                                       |
-| ---- | ----------------- | ------------------------------------------- |
-| CPU  | 1 missing word    | Low overhead, fast for small searches       |
-| GPU  | 2-3 missing words | Massive parallelism for checksum validation |
-| Auto | Any               | Automatically selects best available option |
+#### Device Selection
+
+| Mode     | Best For          | Notes                                           |
+| -------- | ----------------- | ----------------------------------------------- |
+| `auto`   | Any               | Auto-selects best available (CUDA > OpenCL > CPU) |
+| `gpu`    | Any GPU           | Uses best available GPU backend                 |
+| `cuda`   | NVIDIA GPUs       | Forces CUDA backend                             |
+| `opencl` | Intel/AMD GPUs    | Forces OpenCL backend                           |
+| `cpu`    | 1 missing word    | Low overhead, fast for small searches           |
 
 ## How It Works
 
@@ -264,12 +315,21 @@ Possible reasons:
 - Reduce worker count with `-w` flag
 - Close other applications
 
-### GPU Not Detected
+### CUDA GPU Not Detected
 
 - Ensure NVIDIA drivers are installed
 - Install CUDA toolkit from NVIDIA
 - Install `numpy` and `numba` packages
 - Verify with: `python -c "from numba import cuda; print(cuda.is_available())"`
+
+### OpenCL GPU Not Detected
+
+- Install OpenCL runtime for your GPU:
+  - **Intel**: `sudo apt install intel-opencl-icd`
+  - **AMD**: `sudo apt install mesa-opencl-icd` or install ROCm
+  - **NVIDIA**: OpenCL is included with NVIDIA drivers
+- Install `numpy` and `pyopencl` packages
+- Verify with: `python -c "import pyopencl as cl; print([d.name for p in cl.get_platforms() for d in p.get_devices()])"`
 
 ### GPU Out of Memory
 
@@ -284,12 +344,20 @@ Possible reasons:
 - [mnemonic](https://pypi.org/project/mnemonic/) - BIP-39 wordlist and validation
 - [bip_utils](https://pypi.org/project/bip-utils/) - Multi-chain address derivation
 - [tqdm](https://pypi.org/project/tqdm/) - Progress bar
-
-### Optional (GPU Acceleration)
-
 - [numpy](https://pypi.org/project/numpy/) - Numerical arrays for GPU data transfer
+
+### Optional (CUDA - NVIDIA GPUs)
+
 - [numba](https://pypi.org/project/numba/) - CUDA JIT compilation for GPU kernels
 - NVIDIA CUDA Toolkit - GPU drivers and runtime
+
+### Optional (OpenCL - Intel/AMD GPUs)
+
+- [pyopencl](https://pypi.org/project/pyopencl/) - OpenCL bindings for Python
+- OpenCL runtime:
+  - Intel: `intel-opencl-icd` package
+  - AMD: `mesa-opencl-icd` or ROCm
+  - NVIDIA: Included with drivers
 
 ## License
 

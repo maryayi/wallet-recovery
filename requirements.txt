@@ -3,6 +3,16 @@ mnemonic>=0.20
 bip_utils>=2.9.0
 tqdm>=4.66.0
 
-# Optional: GPU acceleration (CUDA)
+# Required for GPU acceleration
 numpy>=1.24.0
+
+# Optional: CUDA GPU acceleration (NVIDIA)
 numba>=0.58.0
+
+# Optional: OpenCL GPU acceleration (Intel/AMD/NVIDIA)
+# Install with: pip install pyopencl
+# Also requires OpenCL runtime:
+#   - Intel: Install Intel GPU drivers or Intel oneAPI
+#   - AMD: Install AMD ROCm or AMDGPU-PRO drivers
+#   - NVIDIA: Install NVIDIA drivers (OpenCL included)
+pyopencl>=2024.1
