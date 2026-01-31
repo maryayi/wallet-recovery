@@ -1175,6 +1175,8 @@ def recover_phrase_opencl(
     # Compile OpenCL kernel
     try:
         prg = cl.Program(ctx, OPENCL_KERNEL_SOURCE).build()
+        # Retrieve kernel once to avoid repeated retrieval overhead
+        kernel = cl.Kernel(prg, "validate_checksums")
     except cl.RuntimeError as e:
         print(f"ERROR: Failed to compile OpenCL kernel: {e}")
         return None
@@ -1241,8 +1243,8 @@ def recover_phrase_opencl(
             word_indices_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=word_indices)
             valid_flags_buf = cl.Buffer(ctx, mf.WRITE_ONLY, valid_flags.nbytes)
 
-            # Execute kernel
-            prg.validate_checksums(
+            # Execute kernel (using pre-retrieved kernel instance)
+            kernel(
                 queue,
                 (current_batch_size,),
                 None,  # Let OpenCL choose work group size
